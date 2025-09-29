@@ -99,6 +99,206 @@ def create_extra_msa_feature(batch):
               jnp.expand_dims(batch['extra_deletion_value'], axis=-1)]
   return jnp.concatenate(msa_feat, axis=-1)
 
+
+
+
+class EmbedProcess(hk.Module):
+  """A single recycling iteration of AlphaFold architecture.
+  Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 3-22
+  """
+  #alphafold/alphafold_iteration/evoformer -->  embed_proces/
+  def __init__(self, config, name='embed_proces'):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = config.global_config
+
+  def __call__(self, batch, safe_key=None):
+
+      c = self.config
+      gc = self.global_config
+      dtype = jnp.bfloat16 if gc.bfloat16 else jnp.float32
+
+      if safe_key is None:
+          safe_key = prng.SafeKey(hk.next_rng_key())
+
+      with utils.bfloat16_context():
+
+          # Embed clustered MSA.
+          # Jumper et al. (2021) Suppl. Alg. 2 "Inference" line 5
+          # Jumper et al. (2021) Suppl. Alg. 3 "InputEmbedder"
+
+          msa_feat = batch['msa_feat'].astype(dtype)
+          target_feat = jnp.pad(batch["target_feat"].astype(dtype), [[0, 0], [1, 1]])
+          preprocess_1d = common_modules.Linear(c.msa_channel, name='preprocess_1d')(target_feat)
+          preprocess_1d = jnp.where(target_feat.sum(-1, keepdims=True) == 0, 0, preprocess_1d)
+          preprocess_msa = common_modules.Linear(c.msa_channel, name='preprocess_msa')(msa_feat)
+          msa_activations = preprocess_1d[None] + preprocess_msa
+
+          left_single = common_modules.Linear(c.pair_channel, name='left_single')(target_feat)
+          right_single = common_modules.Linear(c.pair_channel, name='right_single')(target_feat)
+          pair_activations = left_single[:, None] + right_single[None]
+
+          mask_2d = batch['seq_mask'][:, None] * batch['seq_mask'][None, :]
+          mask_2d = mask_2d.astype(dtype)
+
+          # Inject previous outputs for recycling.
+          # Jumper et al. (2021) Suppl. Alg. 2 "Inference" line 6
+          # Jumper et al. (2021) Suppl. Alg. 32 "RecyclingEmbedder"
+
+          if "prev_dgram" in batch:
+              dgram = batch["prev_dgram"]
+          else:
+              prev_pseudo_beta = pseudo_beta_fn(batch['aatype'], batch['prev_pos'], None)
+              dgram = dgram_from_positions(prev_pseudo_beta, **c.prev_pos)
+          dgram = dgram.astype(dtype)
+          pair_activations += common_modules.Linear(c.pair_channel, name='prev_pos_linear')(dgram)
+
+          if c.recycle_features:
+              if 'prev_msa_first_row' in batch:
+                  prev_msa_first_row = common_modules.LayerNorm(
+                      axis=[-1], create_scale=True, create_offset=True,
+                      name='prev_msa_first_row_norm')(batch['prev_msa_first_row']).astype(dtype)
+                  msa_activations = msa_activations.at[0].add(prev_msa_first_row)
+
+              if 'prev_pair' in batch:
+                  pair_activations += common_modules.LayerNorm(
+                      axis=[-1], create_scale=True, create_offset=True,
+                      name='prev_pair_norm')(batch['prev_pair']).astype(dtype)
+
+          # Relative position encoding.
+          # Jumper et al. (2021) Suppl. Alg. 4 "relpos"
+          # Jumper et al. (2021) Suppl. Alg. 5 "one_hot"
+          if c.max_relative_feature:
+              # Add one-hot-encoded clipped residue distances to the pair activations.
+              if "rel_pos" in batch:
+                  rel_pos = batch['rel_pos'].astype(dtype)
+              else:
+                  if "offset" in batch:
+                      offset = batch['offset']
+                  else:
+                      pos = batch['residue_index']
+                      offset = pos[:, None] - pos[None, :]
+                  if "asym_id" in batch:
+                      o = batch['asym_id'][:, None] - batch['asym_id'][None, :]
+                      offset = jnp.where(o == 0, offset, jnp.where(o > 0, 2 * c.max_relative_feature, 0))
+                  rel_pos = jax.nn.one_hot(
+                      jnp.clip(
+                          offset + c.max_relative_feature,
+                          a_min=0,
+                          a_max=2 * c.max_relative_feature),
+                      2 * c.max_relative_feature + 1).astype(dtype)
+              pair_activations += common_modules.Linear(c.pair_channel, name='pair_activiations')(rel_pos)
+
+          # Embed templates into the pair activations.
+          # Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 9-13
+
+          if c.template.enabled:
+              template_batch = {k: batch[k] for k in batch if k.startswith('template_')}
+
+              multichain_mask = batch['asym_id'][:, None] == batch['asym_id'][None, :]
+              multichain_mask = jnp.where(batch["mask_template_interchain"], multichain_mask, True)
+
+              template_pair_representation = TemplateEmbedding(c.template, gc)(
+                  pair_activations,
+                  template_batch,
+                  mask_2d,
+                  multichain_mask,
+                  use_dropout=batch["use_dropout"])
+
+              pair_activations += template_pair_representation
+
+          # Embed extra MSA features.
+          # Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 14-16
+          if c.use_extra_msa:
+              extra_msa_feat = create_extra_msa_feature(batch)
+              extra_msa_activations = common_modules.Linear(c.extra_msa_channel,
+                                                            name='extra_msa_activations')(extra_msa_feat).astype(dtype)
+              # Extra MSA Stack.
+              # Jumper et al. (2021) Suppl. Alg. 18 "ExtraMsaStack"
+              extra_msa_stack_input = {'msa': extra_msa_activations,
+                                       'pair': pair_activations}
+              extra_msa_stack_iteration = EvoformerIteration(c.evoformer, gc,
+                                                             is_extra_msa=True, name='extra_msa_stack')
+
+              def extra_msa_stack_fn(x):
+                  act, safe_key = x
+                  safe_key, safe_subkey = safe_key.split()
+                  extra_evoformer_output = extra_msa_stack_iteration(
+                      activations=act,
+                      masks={'msa': batch['extra_msa_mask'].astype(dtype),
+                             'pair': mask_2d},
+                      safe_key=safe_subkey,
+                      use_dropout=batch["use_dropout"])
+                  return (extra_evoformer_output, safe_key)
+
+              if gc.use_remat: extra_msa_stack_fn = hk.remat(extra_msa_stack_fn)
+              extra_msa_stack = layer_stack.layer_stack(c.extra_msa_stack_num_block)(extra_msa_stack_fn)
+              extra_msa_output, safe_key = extra_msa_stack((extra_msa_stack_input, safe_key))
+              pair_activations = extra_msa_output['pair']
+
+          evoformer_input = {'msa': msa_activations, 'pair': pair_activations}
+          evoformer_masks = {'msa': batch['msa_mask'].astype(dtype),
+                             'pair': mask_2d}
+          ####################################################################
+
+          # Append num_templ rows to msa_activations with template embeddings.
+          # Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 7-8
+          if c.template.enabled and c.template.embed_torsion_angles:
+              num_templ, num_res = batch['template_aatype'].shape
+              # Embed the templates aatypes.
+              aatype = batch['template_aatype']
+              aatype_one_hot = jax.nn.one_hot(batch['template_aatype'], 22, axis=-1)
+
+              # Embed the templates aatype, torsion angles and masks.
+              # Shape (templates, residues, msa_channels)
+              ret = all_atom.atom37_to_torsion_angles(
+                  aatype=aatype,
+                  all_atom_pos=batch['template_all_atom_positions'],
+                  all_atom_mask=batch['template_all_atom_mask'],
+                  # Ensure consistent behaviour during testing:
+                  placeholder_for_undefined=not gc.zero_init)
+
+              template_features = jnp.concatenate([
+                  aatype_one_hot,
+                  jnp.reshape(ret['torsion_angles_sin_cos'], [num_templ, num_res, 14]),
+                  jnp.reshape(ret['alt_torsion_angles_sin_cos'], [num_templ, num_res, 14]),
+                  ret['torsion_angles_mask']], axis=-1).astype(dtype)
+
+              template_activations = common_modules.Linear(
+                  c.msa_channel,
+                  initializer='relu',
+                  name='template_single_embedding')(template_features)
+              template_activations = jax.nn.relu(template_activations)
+              template_activations = common_modules.Linear(
+                  c.msa_channel,
+                  initializer='relu',
+                  name='template_projection')(template_activations)
+
+              # Concatenate the templates to the msa.
+              evoformer_input['msa'] = jnp.concatenate([evoformer_input['msa'], template_activations], axis=0)
+
+              # Concatenate templates masks to the msa masks.
+              # Use mask from the psi angle, as it only depends on the backbone atoms
+              # from a single residue.
+              torsion_angle_mask = ret['torsion_angles_mask'][:, :, 2]
+              torsion_angle_mask = torsion_angle_mask.astype(evoformer_masks['msa'].dtype)
+              evoformer_masks['msa'] = jnp.concatenate([evoformer_masks['msa'], torsion_angle_mask], axis=0)
+
+      output = {
+          'evoformer_masks': evoformer_masks,
+          'evoformer_input': evoformer_input,
+      }
+
+      # Convert back to float32 if we're not saving memory.
+      if not gc.bfloat16_output:
+          for k, v in output.items():
+              if v.dtype == jnp.bfloat16:
+                  output[k] = v.astype(jnp.float32)
+      return output
+
+
+
+
 class AlphaFoldIteration(hk.Module):
   """A single recycling iteration of AlphaFold architecture.
   Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 3-22
