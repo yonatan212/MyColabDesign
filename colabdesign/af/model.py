@@ -16,6 +16,201 @@ from colabdesign.af.utils  import _af_utils
 from colabdesign.af.design import _af_design
 from colabdesign.af.inputs import _af_inputs, update_seq, update_aatype
 
+
+
+################################################################
+# mk_af_embed - initialize model, and put it all together
+################################################################
+
+class mk_af_embed(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _af_utils):
+    def __init__(self,
+                 protocol="fixbb",
+                 use_multimer=False,
+                 use_templates=False,
+                 debug=False,
+                 data_dir=".",
+                 **kwargs):
+        assert protocol in ["fixbb", "hallucination", "binder", "partial"]
+
+        self.protocol = protocol
+        self._num = kwargs.pop("num_seq", 1)
+        self._args = {"use_templates": use_templates, "num_templates": 0,
+                      "use_multimer": use_multimer, "use_bfloat16": True,
+                      "optimize_seq": True, "recycle_mode": "last",
+                      "use_mlm": False, "mask_target": False, "unbias_mlm": False,
+                      "realign": True,
+                      "debug": debug, "repeat": False, "homooligomer": False, "copies": 1,
+                      "optimizer": "sgd", "best_metric": "loss",
+                      "traj_iter": 1, "traj_max": 10000,
+                      "clear_prev": True, "use_dgram": False, "use_dgram_pred": False,
+                      "shuffle_first": True, "use_remat": True,
+                      "alphabet_size": 20,
+                      "use_initial_guess": False, "use_initial_atom_pos": False}
+
+        if self.protocol == "binder": self._args["use_templates"] = True
+
+        self.opt = {"dropout": True, "pssm_hard": False, "learning_rate": 0.1, "norm_seq_grad": True,
+                    "num_recycles": 0, "num_models": 1, "sample_models": True,
+                    "temp": 1.0, "soft": 0.0, "hard": 0.0, "alpha": 2.0,
+                    "con": {"num": 2, "cutoff": 14.0, "binary": False, "seqsep": 9, "num_pos": float("inf")},
+                    "i_con": {"num": 1, "cutoff": 21.6875, "binary": False, "num_pos": float("inf")},
+                    "template": {"rm_ic": False},
+                    "weights": {"seq_ent": 0.0, "plddt": 0.0, "pae": 0.0, "exp_res": 0.0, "helix": 0.0},
+                    "fape_cutoff": 10.0}
+
+        self._params = {}
+        self._inputs = {}
+        self._tmp = {"traj": {"seq": [], "xyz": [], "plddt": [], "pae": []},
+                     "log": [], "best": {}}
+
+        # set arguments/options
+        if "initial_guess" in kwargs: kwargs["use_initial_guess"] = kwargs.pop("initial_guess")
+        model_names = kwargs.pop("model_names", None)
+        keys = list(kwargs.keys())
+        for k in keys:
+            if k in self._args: self._args[k] = kwargs.pop(k)
+            if k in self.opt: self.opt[k] = kwargs.pop(k)
+
+        if self._args["use_templates"] and self._args["num_templates"] == 0:
+            self._args["num_templates"] = 1
+
+        # collect callbacks
+        self._callbacks = {"model": {"pre": kwargs.pop("pre_callback", None),
+                                     "post": kwargs.pop("post_callback", None),
+                                     "loss": kwargs.pop("loss_callback", None)},
+                           "design": {"pre": kwargs.pop("pre_design_callback", None),
+                                      "post": kwargs.pop("post_design_callback", None)}}
+
+        for m, n in self._callbacks.items():
+            for k, v in n.items():
+                if v is None: v = []
+                if not isinstance(v, list): v = [v]
+                self._callbacks[m][k] = v
+
+        if self._args["use_mlm"]:
+            self.opt["mlm_dropout"] = 0.15
+            self.opt["weights"]["mlm"] = 0.1
+
+        assert len(kwargs) == 0, f"ERROR: the following inputs were not set: {kwargs}"
+
+        #############################
+        # configure AlphaFold
+        #############################
+        if self._args["use_multimer"]:
+            self._cfg = config.model_config("model_1_multimer")
+            self.opt["pssm_hard"] = True  # TODO
+        else:
+            self._cfg = config.model_config("model_1_ptm" if self._args["use_templates"] else "model_3_ptm")
+
+        if self._args["recycle_mode"] in ["average", "first", "last", "sample"]:
+            num_recycles = 0
+        else:
+            num_recycles = self.opt["num_recycles"]
+        self._cfg.model.num_recycle = num_recycles
+        self._cfg.model.global_config.use_remat = self._args["use_remat"]
+        self._cfg.model.global_config.use_dgram_pred = self._args["use_dgram_pred"]
+        self._cfg.model.global_config.bfloat16 = self._args["use_bfloat16"]
+        self._cfg.model.embeddings_and_evoformer.template.enabled = self._args["use_templates"]
+
+        # load model_params
+        if model_names is None:
+            model_names = []
+            if self._args["use_multimer"]:
+                model_names += [f"model_{k}_multimer_v3" for k in [1, 2, 3, 4, 5]]
+            else:
+                if self._args["use_templates"]:
+                    model_names += [f"model_{k}_ptm" for k in [1, 2]]
+                else:
+                    model_names += [f"model_{k}_ptm" for k in [1, 2, 3, 4, 5]]
+
+        self._model_params, self._model_names = [], []
+        for model_name in model_names:
+            params = data.get_model_haiku_params(model_name=model_name, data_dir=data_dir,
+                                                 fuse=True, rm_templates=not self._args["use_templates"])
+            if params is not None:
+                self._model_params.append(params)
+                self._model_names.append(model_name)
+            else:
+                print(f"WARNING: '{model_name}' not found")
+
+        #####################################
+        # set protocol specific functions
+        #####################################
+        idx = ["fixbb", "hallucination", "binder", "partial"].index(self.protocol)
+        self.prep_inputs = [self._prep_fixbb, self._prep_hallucination, self._prep_binder, self._prep_partial][idx]
+        self._get_loss = [self._loss_fixbb, self._loss_hallucination, self._loss_binder, self._loss_partial][idx]
+
+    def _get_model(self, cfg, callback=None):
+
+        a = self._args
+        runner = model.RunEmbed(cfg,
+                                recycle_mode=a["recycle_mode"],
+                                use_multimer=a["use_multimer"])
+
+        # setup function to get gradients
+        def _model(params, model_params, inputs, key):
+
+            opt = inputs["opt"]
+            aux = {}
+            key = Key(key=key).get
+
+            #######################################################################
+            # INPUTS
+            #######################################################################
+            # get sequence
+            if a["optimize_seq"]:
+                seq = self._update_seq(params, inputs, aux, key())
+            else:
+                # TODO
+                inputs["seq"] = seq = None
+
+            # define masks
+            inputs["msa_mask"] = jnp.where(inputs["seq_mask"], inputs["msa_mask"], 0)
+
+            # update template features
+            inputs["mask_template_interchain"] = opt["template"]["rm_ic"]
+            if a["use_templates"]:
+                self._update_template(inputs, key())
+
+            # set dropout
+            inputs["use_dropout"] = opt["dropout"]
+
+            if "batch" not in inputs:
+                inputs["batch"] = None
+
+            # optimize model params
+            if "model_params" in params:
+                model_params.update(params["model_params"])
+
+            # pre callback
+            for fn in self._callbacks["model"]["pre"]:
+                fn_args = {"inputs": inputs, "opt": opt, "aux": aux, "seq": seq,
+                           "key": key(), "params": params, "model_params": model_params}
+                sub_args = {k: fn_args.get(k, None) for k in signature(fn).parameters}
+                fn(**sub_args)
+
+            #######################################################################
+            # OUTPUTS
+            #######################################################################
+            outputs = runner.apply(model_params, key(), inputs)
+
+            # add aux outputs
+            aux.update({'outputs' : outputs})
+
+            #######################################################################
+            # LOSS
+            #######################################################################
+
+            loss = {}
+
+            return loss, aux
+
+        return {"grad_fn": jax.jit(jax.value_and_grad(_model, has_aux=True, argnums=0)),
+                "fn": jax.jit(_model), "runner": runner}
+
+
+
+
 ################################################################
 # MK_DESIGN_MODEL - initialize model, and put it all together
 ################################################################

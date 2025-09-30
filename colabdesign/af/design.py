@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 from colabdesign.af.alphafold.common import residue_constants
 from colabdesign.shared.utils import copy_dict, update_dict, Key, dict_to_str, to_float, softmax, categorical, to_list, copy_missing
-
+import re
 ####################################################
 # AF_DESIGN - design functions
 ####################################################
@@ -22,6 +22,9 @@ from colabdesign.shared.utils import copy_dict, update_dict, Key, dict_to_str, t
 ####################################################
 
 class _af_design:
+
+
+
 
   def restart(self, seed=None, opt=None, weights=None,
               seq=None, mode=None, keep_history=False, reset_opt=True, **kwargs):   
@@ -77,8 +80,9 @@ class _af_design:
       model_nums = ns[:m]
     return model_nums   
 
+
   def run(self, num_recycles=None, num_models=None, sample_models=None, models=None,
-          backprop=True, callback=None, model_nums=None, return_aux=False):
+          backprop=True, callback=None, model_nums=None, return_aux=False, embed = None):
     '''run model to get outputs, losses and gradients'''
     
     # pre-design callbacks
@@ -93,7 +97,7 @@ class _af_design:
     auxs = []
     for n in model_nums:
       p = self._model_params[n]
-      auxs.append(self._recycle(p, num_recycles=num_recycles, backprop=backprop))
+      auxs.append(self._recycle(p, num_recycles=num_recycles, backprop=backprop, embed=embed))
     auxs = jax.tree_util.tree_map(lambda *x: np.stack(x), *auxs)
 
     # update aux (average outputs)
@@ -102,6 +106,10 @@ class _af_design:
       else: return x.mean(0)
 
     self.aux = jax.tree_util.tree_map(avg_or_first, auxs)
+
+    if embed:
+        return self.aux
+
     self.aux["atom_positions"] = auxs["atom_positions"][0]
     self.aux["all"] = auxs
     
@@ -132,19 +140,24 @@ class _af_design:
     
     if return_aux: return self.aux
 
-  def _single(self, model_params, backprop=True):
+  def _single(self, model_params, backprop=True ,embed = None):
     '''single pass through the model'''
     self._inputs["opt"] = self.opt
     flags  = [self._params, model_params, self._inputs, self.key()]
+    if embed:
+        aux = self._model["fn"](*flags)
+        return aux
+
     if backprop:
       (loss, aux), grad = self._model["grad_fn"](*flags)
+
     else:
       loss, aux = self._model["fn"](*flags)
       grad = jax.tree_util.tree_map(np.zeros_like, self._params)
     aux.update({"loss":loss,"grad":grad})
     return aux
 
-  def _recycle(self, model_params, num_recycles=None, backprop=True):   
+  def _recycle(self, model_params, num_recycles=None, backprop=True, embed = None):
     '''multiple passes through the model (aka recycle)'''
     a = self._args
     mode = a["recycle_mode"]
@@ -559,3 +572,50 @@ class _af_design:
           (best_loss, self._k) = (loss, i)
           self.set_seq(seq=current_seq, bias=self._inputs["bias"])
           self._save_results(save_best=save_best, verbose=verbose)
+
+
+
+
+def remap_prefix(params, old_prefix, new_prefix, *, dry_run=False, verbose=True):
+    """
+    מחליף prefix בתחילת כל מפתח: old_prefix -> new_prefix.
+    אם params הוא hk.data_structures.FlatMapping → מוחזר FlatMapping;
+    אחרת מוחזר dict רגיל.
+    """
+    try:
+        import haiku as hk
+        is_flat = isinstance(params, hk.data_structures.FlatMapping)
+        to_mut  = hk.data_structures.to_mutable_dict if is_flat else (lambda x: dict(x))
+        to_imm  = hk.data_structures.to_immutable_dict if is_flat else (lambda x: x)
+    except Exception:
+        # אם Haiku לא זמין—עובדים עם dict
+        is_flat = False
+        to_mut  = lambda x: dict(x)
+        to_imm  = lambda x: x
+
+    p = to_mut(params)
+
+    pat = re.compile(rf"^(?:{re.escape(old_prefix)})(?=/|$)")
+    changed = []
+    out = {}
+
+    for k, v in p.items():
+        if pat.search(k):
+            new_k = new_prefix + k[len(old_prefix):]
+            changed.append((k, new_k))
+            out[new_k] = v
+        else:
+            out[k] = v
+
+    if verbose:
+        print(f"[remap_prefix] total: {len(p)} | changed: {len(changed)}")
+        for a,b in changed[:20]:
+            print(f"  {a}  →  {b}")
+        if len(changed) > 20:
+            print("  ...")
+
+    if dry_run:
+        # לא משנים כלום, מחזירים את המקור כפי שהוא (כולל הטיפוס המקורי)
+        return params
+
+    return to_imm(out)

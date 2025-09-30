@@ -97,7 +97,7 @@ class RunEmbed:
 
         self.apply = jax.jit(apply)
 
-        
+
 class RunModel:
   """Container for JAX model."""
 
