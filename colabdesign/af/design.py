@@ -166,8 +166,9 @@ class _af_design:
 
     if mode in ["backprop","add_prev"]:
       # recycles compiled into model, only need single-pass
-      aux = self._single(model_params, backprop)
-    
+
+      aux = self._single(model_params, backprop,embed = embed )
+
     else:
       L = self._inputs["residue_index"].shape[0]
       
@@ -205,15 +206,16 @@ class _af_design:
       grad = []
       for m in mask:        
         if m == 0:
-          aux = self._single(model_params, backprop=False)
+          aux = self._single(model_params, backprop=False, embed=embed)
         else:
           aux = self._single(model_params, backprop)
           grad.append(jax.tree_util.tree_map(lambda x:x*m, aux["grad"]))
-        self._inputs["prev"] = aux["prev"]
+        if aux["prev"]:
+          self._inputs["prev"] = aux["prev"]
         if a["use_initial_atom_pos"]:
           self._inputs["initial_atom_pos"] = aux["prev"]["prev_pos"]                
-
-      aux["grad"] = jax.tree_util.tree_map(lambda *x: np.stack(x).sum(0), *grad)
+      if not embed:
+        aux["grad"] = jax.tree_util.tree_map(lambda *x: np.stack(x).sum(0), *grad)
     
     aux["num_recycles"] = num_recycles
     return aux
