@@ -112,11 +112,25 @@ class EmbedProcess(hk.Module):
     self.config = config
     self.global_config = config.global_config
 
-  def __call__(self, batch, safe_key=None):
+  def __call__(self, batch, safe_key=None, **kwargs):
 
-      c = self.config
+      c = self.config.embeddings_and_evoformer
       gc = self.global_config
       dtype = jnp.bfloat16 if gc.bfloat16 else jnp.float32
+
+      def get_prev(ret):
+          new_prev = {
+              'prev_msa_first_row': ret['representations']['msa_first_row'],
+              'prev_pair': ret['representations']['pair'],
+              'prev_pos': ret['structure_module']['final_atom_positions']
+          }
+          if self.global_config.use_dgram:
+              new_prev['prev_dgram'] = ret["distogram"]["logits"]
+          return new_prev
+
+      prev = batch.pop("prev")
+      batch = {**batch, **prev}
+
 
       if safe_key is None:
           safe_key = prng.SafeKey(hk.next_rng_key())

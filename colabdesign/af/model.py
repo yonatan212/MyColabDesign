@@ -143,14 +143,15 @@ class mk_af_embed(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _af_
     def _get_model(self, cfg, callback=None):
 
         a = self._args
-        runner = model.RunEmbed(cfg,
+        runner = model.RunModel(cfg,
                                 recycle_mode=a["recycle_mode"],
                                 use_multimer=a["use_multimer"])
 
         # setup function to get gradients
         def _model(params, model_params, inputs, key):
-
+            inputs["params"] = params
             opt = inputs["opt"]
+
             aux = {}
             key = Key(key=key).get
 
@@ -158,14 +159,24 @@ class mk_af_embed(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _af_
             # INPUTS
             #######################################################################
             # get sequence
-            if a["optimize_seq"]:
-                seq = self._update_seq(params, inputs, aux, key())
+            seq = self._get_seq(inputs, aux, key())
+
+            # update sequence features
+            pssm = jnp.where(opt["pssm_hard"], seq["hard"], seq["pseudo"])
+            if a["use_mlm"]:
+                shape = seq["pseudo"].shape[:2]
+                mlm = jax.random.bernoulli(key(), opt["mlm_dropout"], shape)
+                update_seq(seq["pseudo"], inputs, seq_pssm=pssm, mlm=mlm)
             else:
-                # TODO
-                inputs["seq"] = seq = None
+                update_seq(seq["pseudo"], inputs, seq_pssm=pssm)
+
+            # update amino acid sidechain identity
+            update_aatype(seq["pseudo"][0].argmax(-1), inputs)
 
             # define masks
             inputs["msa_mask"] = jnp.where(inputs["seq_mask"], inputs["msa_mask"], 0)
+
+            inputs["seq"] = aux["seq"]
 
             # update template features
             inputs["mask_template_interchain"] = opt["template"]["rm_ic"]
@@ -178,14 +189,10 @@ class mk_af_embed(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _af_
             if "batch" not in inputs:
                 inputs["batch"] = None
 
-            # optimize model params
-            if "model_params" in params:
-                model_params.update(params["model_params"])
-
             # pre callback
             for fn in self._callbacks["model"]["pre"]:
-                fn_args = {"inputs": inputs, "opt": opt, "aux": aux, "seq": seq,
-                           "key": key(), "params": params, "model_params": model_params}
+                fn_args = {"inputs": inputs, "opt": opt, "aux": aux,
+                           "seq": seq, "key": key(), "params": params}
                 sub_args = {k: fn_args.get(k, None) for k in signature(fn).parameters}
                 fn(**sub_args)
 
@@ -195,14 +202,9 @@ class mk_af_embed(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _af_
             outputs = runner.apply(model_params, key(), inputs)
 
             # add aux outputs
-            aux.update({'outputs' : outputs})
-
-            #######################################################################
-            # LOSS
-            #######################################################################
+            aux.update({'outputs':outputs})
 
             loss = {}
-
             return loss, aux
 
         return {"grad_fn": jax.jit(jax.value_and_grad(_model, has_aux=True, argnums=0)),
