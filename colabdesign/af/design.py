@@ -291,7 +291,7 @@ class _af_design:
   def predict(self, seq=None, bias=None,
               num_models=None, num_recycles=None, models=None, sample_models=False,
               dropout=False, hard=True, soft=False, temp=1,
-              return_aux=False, verbose=True,  seed=None, embed=embed, **kwargs):
+              return_aux=False, verbose=True,  seed=None, embed=None, **kwargs):
     '''predict structure for input sequence (if provided)'''
 
     def load_settings():    
