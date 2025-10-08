@@ -99,7 +99,7 @@ def flat_params_to_haiku(params, fuse=None):
               "template_embedding/single_template_embedding/template_embedding_iteration",
               "template_embedding/single_template_embedding/template_pair_stack/__layer_stack_no_state"]:
       for b in ["triangle_multiplication_incoming","triangle_multiplication_outgoing"]:
-        k = f"alphafold/alphafold_iteration/evoformer/{a}/{b}"
+        k = f"embed_proces/{a}/{b}"
 
         if fuse and f"{k}/center_layer_norm" in P:
           for c in ["gate","projection"]:

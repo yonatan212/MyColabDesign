@@ -125,14 +125,14 @@ class mk_af_embed(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _af_
 
         self._model_params, self._model_names = [], []
         for model_name in model_names:
-            params = data.get_model_haiku_params(model_name=model_name, data_dir=data_dir,
-                                                 fuse=True, rm_templates=not self._args["use_templates"])
+            params = data.get_model_haiku_params(model_name=model_name, data_dir=data_dir, fuse=True)
             if params is not None:
+                if not self._args["use_multimer"] and not self._args["use_templates"]:
+                    params = {k: v for k, v in params.items() if "template" not in k}
                 self._model_params.append(params)
                 self._model_names.append(model_name)
             else:
                 print(f"WARNING: '{model_name}' not found")
-
         #####################################
         # set protocol specific functions
         #####################################
@@ -143,7 +143,7 @@ class mk_af_embed(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _af_
     def _get_model(self, cfg, callback=None):
 
         a = self._args
-        runner = model.RunModel(cfg,
+        runner = model.RunEmbed(cfg,
                                 recycle_mode=a["recycle_mode"],
                                 use_multimer=a["use_multimer"])
 
