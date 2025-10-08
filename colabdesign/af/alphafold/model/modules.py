@@ -298,16 +298,23 @@ class EmbedProcess(hk.Module):
               torsion_angle_mask = torsion_angle_mask.astype(evoformer_masks['msa'].dtype)
               evoformer_masks['msa'] = jnp.concatenate([evoformer_masks['msa'], torsion_angle_mask], axis=0)
 
+
+
+      # Convert back to float32 if we're not saving memory.
+      if not gc.bfloat16_output:
+          for k, v in evoformer_input.items():
+              if v.dtype == jnp.bfloat16:
+                  evoformer_input[k] = v.astype(jnp.float32)
+
+
+      if not gc.bfloat16_output:
+          for k, v in evoformer_masks.items():
+              if v.dtype == jnp.bfloat16:
+                  evoformer_masks[k] = v.astype(jnp.float32)
       output = {
           'evoformer_masks': evoformer_masks,
           'evoformer_input': evoformer_input,
       }
-
-      # Convert back to float32 if we're not saving memory.
-      if not gc.bfloat16_output:
-          for k, v in output.items():
-              if v.dtype == jnp.bfloat16:
-                  output[k] = v.astype(jnp.float32)
       return output
 
 

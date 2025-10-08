@@ -210,6 +210,8 @@ class _af_design:
         else:
           aux = self._single(model_params, backprop)
           grad.append(jax.tree_util.tree_map(lambda x:x*m, aux["grad"]))
+        if embed:
+          return aux
         if aux["prev"]:
           self._inputs["prev"] = aux["prev"]
         if a["use_initial_atom_pos"]:
@@ -218,7 +220,7 @@ class _af_design:
         aux["grad"] = jax.tree_util.tree_map(lambda *x: np.stack(x).sum(0), *grad)
     
     aux["num_recycles"] = num_recycles
-    return aux
+    return auxs
 
   def step(self, lr_scale=1.0, num_recycles=None,
            num_models=None, sample_models=None, models=None, backprop=True,
