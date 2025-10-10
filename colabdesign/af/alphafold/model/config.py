@@ -159,7 +159,8 @@ CONFIG = ml_collections.ConfigDict({
                     'gating': True,
                     'num_head': 8,
                     'orientation': 'per_row',
-                    'shared_dropout': True
+                    'shared_dropout': True,
+                    'get_embed': True
                 },
                 'msa_column_attention': {
                     'dropout_rate': 0.0,

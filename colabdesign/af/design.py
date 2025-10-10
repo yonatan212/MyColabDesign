@@ -143,7 +143,7 @@ class _af_design:
   def _single(self, model_params, backprop=True ,embed = None):
     '''single pass through the model'''
     self._inputs["opt"] = self.opt
-    flags  = [self._params, model_params, self._inputs, self.key()]
+    flags  = [self._params, model_params, self._inputs, self.k3ey()]
     if embed:
         aux = self._model["fn"](*flags)
         return aux
@@ -222,6 +222,141 @@ class _af_design:
     aux["num_recycles"] = num_recycles
     return auxs
 
+  def run_embed(self, num_recycles=None, num_models=None, sample_models=None, models=None,
+          backprop=True, callback=None, model_nums=None, return_aux=False):
+    '''run model to get outputs, losses and gradients'''
+
+    # pre-design callbacks
+    for fn in self._callbacks["design"]["pre"]: fn(self)
+
+    # decide which model params to use
+    if model_nums is None:
+      model_nums = self._get_model_nums(num_models, sample_models, models)
+    assert len(model_nums) > 0, "ERROR: no model params defined"
+
+    # loop through model params
+    auxs = []
+    for n in model_nums:
+      p = self._model_params[n]
+      auxs.append(self._recycle_embed(p, num_recycles=num_recycles, backprop=backprop))
+    auxs = jax.tree_util.tree_map(lambda *x: np.stack(x), *auxs)
+
+    # update aux (average outputs)
+    def avg_or_first(x):
+      if np.issubdtype(x.dtype, np.integer):
+        return x[0]
+      else:
+        return x.mean(0)
+
+    self.aux = jax.tree_util.tree_map(avg_or_first, auxs)
+
+
+    return self.aux
+
+    '''self.aux["atom_positions"] = auxs["atom_positions"][0]
+    self.aux["all"] = auxs
+
+    # post-design callbacks
+    for fn in (self._callbacks["design"]["post"] + to_list(callback)): fn(self)
+
+    # update log
+    self.aux["log"] = {**self.aux["losses"]}
+    self.aux["log"]["plddt"] = 1 - self.aux["log"]["plddt"]
+    for k in ["loss", "i_ptm", "ptm"]: self.aux["log"][k] = self.aux[k]
+    for k in ["hard", "soft", "temp"]: self.aux["log"][k] = self.opt[k]
+
+    # compute sequence recovery
+    if self.protocol in ["fixbb", "partial"] or (self.protocol == "binder" and self._args["redesign"]):
+      if self.protocol == "partial":
+        aatype = self.aux["aatype"][..., self.opt["pos"]]
+      else:
+        aatype = self.aux["seq"]["pseudo"].argmax(-1)
+
+      mask = self._wt_aatype != -1
+      true = self._wt_aatype[mask]
+      pred = aatype[..., mask]
+      self.aux["log"]["seqid"] = (true == pred).mean()
+
+    self.aux["log"] = to_float(self.aux["log"])
+    self.aux["log"].update({"recycles": int(self.aux["num_recycles"]),
+                            "models": model_nums})
+
+    if return_aux: return self.aux'''
+
+  def _single_embed(self, model_params, backprop=True):
+    '''single pass through the model'''
+    self._inputs["opt"] = self.opt
+    flags = [self._params, model_params, self._inputs, self.k3ey()]
+    aux = self._model["fn_embed"](*flags)
+    return aux
+
+
+
+  def _recycle_embed(self, model_params, num_recycles=None, backprop=True):
+    '''multiple passes through the model (aka recycle)'''
+    a = self._args
+    mode = a["recycle_mode"]
+    if num_recycles is None:
+      num_recycles = self.opt["num_recycles"]
+
+    if mode in ["backprop", "add_prev"]:
+      # recycles compiled into model, only need single-pass
+
+      aux = self._single_embed(model_params, backprop)
+      return aux
+    else:
+      L = self._inputs["residue_index"].shape[0]
+
+      # intialize previous
+      if "prev" not in self._inputs or a["clear_prev"]:
+        prev = {'prev_msa_first_row': np.zeros([L, 256]),
+                'prev_pair': np.zeros([L, L, 128])}
+
+        if a["use_initial_guess"] and "batch" in self._inputs:
+          prev["prev_pos"] = self._inputs["batch"]["all_atom_positions"]
+        else:
+          prev["prev_pos"] = np.zeros([L, 37, 3])
+
+        if a["use_dgram"]:
+          # TODO: add support for initial_guess + use_dgram
+          prev["prev_dgram"] = np.zeros([L, L, 64])
+
+        if a["use_initial_atom_pos"]:
+          if "batch" in self._inputs:
+            self._inputs["initial_atom_pos"] = self._inputs["batch"]["all_atom_positions"]
+          else:
+            self._inputs["initial_atom_pos"] = np.zeros([L, 37, 3])
+
+      self._inputs["prev"] = prev
+      # decide which layers to compute gradients for
+      cycles = (num_recycles + 1)
+      mask = [0] * cycles
+
+      if mode == "sample":  mask[np.random.randint(0, cycles)] = 1
+      if mode == "average": mask = [1 / cycles] * cycles
+      if mode == "last":    mask[-1] = 1
+      if mode == "first":   mask[0] = 1
+
+      # gather gradients across recycles
+      grad = []
+      for m in mask:
+        if m == 0:
+          aux = self._single_embed(model_params, backprop=False)
+        else:
+          aux = self._single_embed(model_params, backprop)
+          grad.append(jax.tree_util.tree_map(lambda x: x * m, aux["grad"]))
+
+        return aux
+
+        '''if aux["prev"]:
+          self._inputs["prev"] = aux["prev"]
+        if a["use_initial_atom_pos"]:
+          self._inputs["initial_atom_pos"] = aux["prev"]["prev_pos"]
+      if not embed:
+        aux["grad"] = jax.tree_util.tree_map(lambda *x: np.stack(x).sum(0), *grad)
+
+    aux["num_recycles"] = num_recycles
+    return auxs'''
   def step(self, lr_scale=1.0, num_recycles=None,
            num_models=None, sample_models=None, models=None, backprop=True,
            callback=None, save_best=False, verbose=1):

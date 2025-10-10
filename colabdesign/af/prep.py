@@ -29,7 +29,8 @@ class _af_prep:
       self._model = self._get_model(self._cfg)
       if sum(self._lengths) > 384:
         self._cfg.model.global_config.subbatch_size = 4
-        self._model["fn"] = self._get_model(self._cfg)["fn"]
+        self._model["fn_embed"] = self._get_model(self._cfg)["fn_embed"]
+        self._model["fn_predict"] = self._get_model(self._cfg)["fn_predict"]
 
     self._opt = copy_dict(self.opt)  
     self.restart(**kwargs)

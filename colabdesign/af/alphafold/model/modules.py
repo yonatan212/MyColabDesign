@@ -10,7 +10,7 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.
+# limitations under the License.12
 
 """Modules and code used in the core part of AlphaFold.
 
@@ -107,7 +107,7 @@ class EmbedProcess(hk.Module):
   Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 3-22
   """
   #alphafold/alphafold_iteration/evoformer -->  embed_proces/
-  def __init__(self, config, name='embed_proces'):
+  def __init__(self, config, name='evoformer'):
     super().__init__(name=name)
     self.config = config
     self.global_config = config.global_config
@@ -318,6 +318,59 @@ class EmbedProcess(hk.Module):
       return output
 
 
+class PredictProcess(hk.Module):
+
+    def __init__(self, config, name='evoformer'):
+        super().__init__(name=name)
+        self.config = config
+        self.global_config = config.global_config
+
+    def __call__(self, batch, safe_key=None, **kwargs):
+
+        c = self.config.embeddings_and_evoformer
+        gc = self.global_config
+        dtype = jnp.bfloat16 if gc.bfloat16 else jnp.float32
+        evoformer_input = batch['evoformer_input'].astype(dtype)
+        with utils.bfloat16_context():
+            if c.use_msa:
+                # Main trunk of the network
+                # Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 17-18
+                evoformer_iteration = EvoformerIteration(c.evoformer, gc, is_extra_msa=False, name='evoformer_iteration')
+
+                def evoformer_fn(x):
+                    act, safe_key = x
+                    safe_key, safe_subkey = safe_key.split()
+                    evoformer_output = evoformer_iteration(
+                        activations=act,
+                        masks=evoformer_masks,
+                        safe_key=safe_subkey,
+                        use_dropout=batch["use_dropout"])
+                    return (evoformer_output, safe_key)
+
+                if gc.use_remat: evoformer_fn = hk.remat(evoformer_fn)
+                evoformer_stack = layer_stack.layer_stack(c.evoformer_num_block)(evoformer_fn)
+                evoformer_output, safe_key = evoformer_stack((evoformer_input, safe_key))
+                msa_activations = evoformer_output['msa']
+                pair_activations = evoformer_output['pair']
+
+            single_activations = common_modules.Linear(c.seq_channel, name='single_activations')(msa_activations[0])
+            num_sequences = batch['msa_feat'].shape[0]
+
+
+        output = {
+            'single': single_activations,
+            'pair': pair_activations,
+            # Crop away template rows such that they are not used in MaskedMsaHead.
+            'msa': msa_activations[:num_sequences, :, :],
+            'msa_first_row': msa_activations[0],
+        }
+
+        # Convert back to float32 if we're not saving memory.
+        if not gc.bfloat16_output:
+            for k, v in output.items():
+                if v.dtype == jnp.bfloat16:
+                    output[k] = v.astype(jnp.float32)
+        return output
 
 
 class AlphaFoldIteration(hk.Module):
@@ -361,6 +414,61 @@ class AlphaFoldIteration(hk.Module):
       ret[name] = heads[name](representations, batch)
     return ret
 
+class AlphaFoldIterationEmbed(hk.Module):
+    """A single recycling iteration of AlphaFold architecture.
+    Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 3-22
+    """
+
+    def __init__(self, config, global_config, name='alphafold_iteration'):
+        super().__init__(name=name)
+        self.config = config
+        self.global_config = global_config
+
+    def __call__(self, batch, **kwargs):
+        embed = EmbedProcess(self.config.embeddings_and_evoformer, self.global_config)
+        return embed(batch)
+class AlphaFoldIterationPrrocess(hk.Module):
+    """A single recycling iteration of AlphaFold architecture.
+    Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 3-22
+    """
+
+    def __init__(self, config, global_config, name='alphafold_iteration'):
+        super().__init__(name=name)
+        self.config = config
+        self.global_config = global_config
+
+    def __call__(self, batch, **kwargs):
+
+        predict_process = PredictProcess(self.config.embeddings_and_evoformer, self.global_config)
+        representations =predict_process(batch)
+        # Compute representations for each batch element and average.
+
+
+        head_factory = {
+            'masked_msa': MaskedMsaHead,
+            'distogram': DistogramHead,
+            'structure_module': folding.StructureModule,
+            'predicted_lddt': PredictedLDDTHead,
+            'predicted_aligned_error': PredictedAlignedErrorHead,
+            'experimentally_resolved': ExperimentallyResolvedHead}
+
+        heads = {}
+        for name, head_config in sorted(self.config.heads.items()):
+            if not head_config.weight: continue
+            heads[name] = head_factory[name](head_config, self.global_config)
+
+        ret = {'representations': representations}
+        for name, head in heads.items():
+            if name in ('predicted_lddt', 'predicted_aligned_error'):
+                continue
+            else:
+                ret[name] = head(representations, batch)
+                if 'representations' in ret[name]:
+                    representations.update(ret[name].pop('representations'))
+
+        for name in ('predicted_lddt', 'predicted_aligned_error'):
+            ret[name] = heads[name](representations, batch)
+        return ret
 class AlphaFold(hk.Module):
   """AlphaFold Jumper et al. (2021) Suppl. Alg. 2 "Inference"""
   def __init__(self, config, name='alphafold'):
