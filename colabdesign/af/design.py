@@ -78,11 +78,93 @@ class _af_design:
       model_nums = np.random.choice(ns,(m,),replace=False)
     else:
       model_nums = ns[:m]
-    return model_nums   
-
+    return model_nums
 
   def run(self, num_recycles=None, num_models=None, sample_models=None, models=None,
-          backprop=True, callback=None, model_nums=None, return_aux=False, embed = None):
+          backprop=True, callback=None, model_nums=None, return_aux=False):
+    '''run model to get outputs, losses and gradients'''
+
+    # pre-design callbacks
+    for fn in self._callbacks["design"]["pre"]: fn(self)
+
+    # decide which model params to use
+    if model_nums is None:
+      model_nums = self._get_model_nums(num_models, sample_models, models)
+    assert len(model_nums) > 0, "ERROR: no model params defined"
+
+    # loop through model params
+    auxs = []
+    for n in model_nums:
+      p = self._model_params[n]
+      auxs.append(self._recycle(p, num_recycles=num_recycles, backprop=backprop, embed=embed))
+    auxs = jax.tree_util.tree_map(lambda *x: np.stack(x), *auxs)
+
+    # update aux (average outputs)
+    def avg_or_first(x):
+      if np.issubdtype(x.dtype, np.integer):
+        return x[0]
+      else:
+        return x.mean(0)
+
+    self.aux = jax.tree_util.tree_map(avg_or_first, auxs)
+
+    if embed:
+      return self.aux
+
+    self.aux["atom_positions"] = auxs["atom_positions"][0]
+    self.aux["all"] = auxs
+
+    # post-design callbacks
+    for fn in (self._callbacks["design"]["post"] + to_list(callback)): fn(self)
+
+    # update log
+    self.aux["log"] = {**self.aux["losses"]}
+    self.aux["log"]["plddt"] = 1 - self.aux["log"]["plddt"]
+    for k in ["loss", "i_ptm", "ptm"]: self.aux["log"][k] = self.aux[k]
+    for k in ["hard", "soft", "temp"]: self.aux["log"][k] = self.opt[k]
+
+    # compute sequence recovery
+    if self.protocol in ["fixbb", "partial"] or (self.protocol == "binder" and self._args["redesign"]):
+      if self.protocol == "partial":
+        aatype = self.aux["aatype"][..., self.opt["pos"]]
+      else:
+        aatype = self.aux["seq"]["pseudo"].argmax(-1)
+
+      mask = self._wt_aatype != -1
+      true = self._wt_aatype[mask]
+      pred = aatype[..., mask]
+      self.aux["log"]["seqid"] = (true == pred).mean()
+
+    self.aux["log"] = to_float(self.aux["log"])
+    self.aux["log"].update({"recycles": int(self.aux["num_recycles"]),
+                            "models": model_nums})
+
+    if return_aux: return self.aux
+
+  def _single_predict(self, model_params, backprop=True):
+    '''single pass through the model'''
+    self._inputs["opt"] = self.opt
+    flags = [self._params, model_params, self._inputs, self.k3ey()]
+
+
+    if backprop:
+      (loss, aux), grad = self._model["grad_fn"](*flags)
+
+    else:
+      loss, aux = self._model["fn_predict"](*flags)
+      grad = jax.tree_util.tree_map(np.zeros_like, self._params)
+    aux.update({"loss": loss, "grad": grad})
+    return aux
+
+  def _recycle_predict(self, model_params, num_recycles=None, backprop=True):
+    '''multiple passes through the model (aka recycle)'''
+
+    aux = self._single_predict(model_params, backprop=False)
+
+    return aux
+
+  def run_predict(self, num_recycles=None, num_models=None, sample_models=None, models=None,
+          backprop=True, callback=None, model_nums=None, return_aux=False):
     '''run model to get outputs, losses and gradients'''
     
     # pre-design callbacks
