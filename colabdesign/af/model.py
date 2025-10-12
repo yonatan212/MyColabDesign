@@ -463,8 +463,7 @@ class mk_af_Mymodel(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _a
             loss = sum([v * w[k] if k in w else v for k, v in aux["losses"].items()])
             return loss, aux
 
-        return {"grad_fn": jax.jit(jax.value_and_grad(_model, has_aux=True, argnums=0)),
-                "fn_embed": jax.jit(_model_embed),  "fn_predict": jax.jit(_model_prdict), "runner": runner}
+        return {"fn_embed": jax.jit(_model_embed),  "fn_predict": jax.jit(_model_prdict), "runner": runner}
 
 
 ################################################################
